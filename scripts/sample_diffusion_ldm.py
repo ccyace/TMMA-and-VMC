@@ -25,11 +25,8 @@ from qdiff.quant_layer import UniformAffineQuantizer
 from qdiff.utils import resume_cali_model, get_train_samples
 from qdiff.max_avg_truncation import (
     load_max_avg_statistics,
-    apply_max_avg_clipping_to_fp_model,
-    set_activation_truncation_from_max_avg,
-    apply_max_avg_clipping_to_model,
-    remove_hooks,
 )
+from qdiff.init_perturbation import initialize_tmma_scales
 
 logger = logging.getLogger(__name__)
 
@@ -390,7 +387,7 @@ def get_parser():
         "--max_avg_json",
         type=str,
         default="",
-        help="分组 max_avg 统计 JSON（两阶段必填；单阶段可选一组截断）",
+        help="分组 TMMA max_avg 统计 JSON（两阶段必填；单阶段可选一组作尺度初始化）",
     )
     parser.add_argument(
         "--max_avg_group",
@@ -748,9 +745,8 @@ def _ldm_stage_brecq(fp_unet, opt, cali_data, cali_xs, cali_ts, max_avg_stats, g
     qnn.set_quant_state(weight_quant=True, act_quant=False)
 
     if opt.quant_act:
-        logger.info("组 %d：激活量化（max_avg 截断, init_bs=%d）", group_id, act_init_bs)
+        logger.info("组 %d：激活量化（TMMA 初始化, init_bs=%d）", group_id, act_init_bs)
         qnn.set_quant_state(True, True)
-        hooks = apply_max_avg_clipping_to_fp_model(fp_unet, max_avg_stats, group_id)
         with torch.no_grad():
             _ = qnn(cali_xs[:act_init_bs].cuda(), cali_ts[:act_init_bs].cuda())
         if opt.running_stat:
@@ -761,6 +757,16 @@ def _ldm_stage_brecq(fp_unet, opt, cali_data, cali_xs, cali_ts, max_avg_stats, g
                     cali_ts[i * act_init_bs : (i + 1) * act_init_bs].cuda(),
                 )
             qnn.set_running_stat(False)
+        group_stats = {
+            layer: groups.get(group_id, None)
+            for layer, groups in max_avg_stats.items()
+        }
+        init_summary = initialize_tmma_scales(qnn, group_stats)
+        logger.info(
+            "组 %d：激活 BRECQ 前 TMMA 初始化 %d 个量化器",
+            group_id,
+            init_summary["matched_quantizers"],
+        )
         kwargs_a = dict(
             cali_data=cali_data,
             batch_size=cali_bs,
@@ -772,9 +778,6 @@ def _ldm_stage_brecq(fp_unet, opt, cali_data, cali_xs, cali_ts, max_avg_stats, g
         )
         logger.info("组 %d：激活 BRECQ", group_id)
         _walk_brecq(qnn, qnn, kwargs_a)
-        remove_hooks(hooks)
-        set_activation_truncation_from_max_avg(qnn, max_avg_stats, group_id)
-        apply_max_avg_clipping_to_model(qnn)
         qnn.set_quant_state(weight_quant=True, act_quant=True)
 
     return qnn
@@ -1139,20 +1142,16 @@ if __name__ == "__main__":
                     logger.info(model.model)
                     logger.info("Doing activation calibration")
                     qnn.set_quant_state(True, True)
-                    max_avg_hooks = []
                     max_avg_stats = None
                     act_init_bs = _cali_init_bs(
                         cali_xs.size(0), preferred=max(1, int(opt.cali_batch_size))
                     )
                     if opt.max_avg_json and str(opt.max_avg_json).strip():
                         logger.info(
-                            "激活 BRECQ：max_avg 截断 group=%d",
+                            "激活 BRECQ：TMMA 初始化 group=%d",
                             opt.max_avg_group,
                         )
                         max_avg_stats = load_max_avg_statistics(opt.max_avg_json.strip())
-                        max_avg_hooks = apply_max_avg_clipping_to_fp_model(
-                            qnn.model, max_avg_stats, opt.max_avg_group
-                        )
                     with torch.no_grad():
                         _ = qnn(cali_xs[:act_init_bs].cuda(), cali_ts[:act_init_bs].cuda())
                         if opt.running_stat:
@@ -1164,18 +1163,22 @@ if __name__ == "__main__":
                                     cali_ts[i * act_init_bs:(i + 1) * act_init_bs].cuda(),
                                 )
                             qnn.set_running_stat(False)
+                        if max_avg_stats is not None:
+                            group_stats = {
+                                layer: groups.get(opt.max_avg_group, None)
+                                for layer, groups in max_avg_stats.items()
+                            }
+                            init_summary = initialize_tmma_scales(qnn, group_stats)
+                            logger.info(
+                                "激活 BRECQ 前：组 %d TMMA 初始化 %d 个量化器",
+                                opt.max_avg_group,
+                                init_summary["matched_quantizers"],
+                            )
                     kwargs = dict(
                         cali_data=cali_data, batch_size=opt.cali_batch_size,
                         iters=opt.cali_iters_a, act_quant=True,
                         opt_mode='mse', lr=opt.cali_lr, p=opt.cali_p)
                     recon_model(qnn)
-                    if max_avg_hooks:
-                        remove_hooks(max_avg_hooks)
-                    if max_avg_stats is not None:
-                        set_activation_truncation_from_max_avg(
-                            qnn, max_avg_stats, opt.max_avg_group
-                        )
-                        apply_max_avg_clipping_to_model(qnn)
                     qnn.set_quant_state(weight_quant=True, act_quant=True)   
 
                 logger.info("Saving calibrated quantized UNet model")

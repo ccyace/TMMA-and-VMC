@@ -81,8 +81,8 @@ def initialize_tmma_interpolation(
             continue
         if not q.sym:
             raise ValueError(
-                "--init_perturb_rho currently requires --a_sym: the TMMA "
-                "statistic is a symmetric clipping magnitude."
+                "TMMA initialization requires --a_sym: the max-average "
+                "statistic is a symmetric activation magnitude."
             )
         delta_tmma = torch.full_like(q.delta.detach(), float(threshold) / float(q.n_levels))
         delta_minmax = q.delta.detach()
@@ -106,6 +106,26 @@ def initialize_tmma_interpolation(
         rho, changed, summary["relative_l2_to_tmma"],
     )
     return tmma, summary
+
+
+def initialize_tmma_scales(qnn: nn.Module, max_avg_stats: dict) -> dict:
+    """Initialize learnable activation scales from TMMA statistics.
+
+    The activation quantizers must first be materialized by an ordinary
+    forward pass.  This function then replaces only their initial ``delta``
+    values with ``S_tmma / (2^(q-1)-1)``.  It does not install clipping hooks
+    or change the full-precision reconstruction target.
+    """
+    _tmma, summary = initialize_tmma_interpolation(qnn, max_avg_stats, rho=0.0)
+    if summary["matched_quantizers"] == 0:
+        raise RuntimeError(
+            "TMMA statistics did not match any learnable activation quantizer"
+        )
+    logger.info(
+        "TMMA initialized %d learnable activation quantizers before BRECQ",
+        summary["matched_quantizers"],
+    )
+    return summary
 
 
 @torch.no_grad()

@@ -34,6 +34,7 @@ from qdiff.utils import resume_cali_model, get_train_samples
 from qdiff.init_perturbation import (
     activation_quantization_probe,
     initialize_tmma_interpolation,
+    initialize_tmma_scales,
     save_json as save_init_probe_json,
     snapshot_activation_scales,
     two_stage_trajectory_probe,
@@ -592,7 +593,6 @@ class Diffusion(object):
         }
         if self.args.quant_act:
             qnn.set_quant_state(True, True)
-            fp_hooks = []
             perturb_enabled = getattr(self.args, "init_perturb_rho", None) is not None
             if perturb_enabled and not (use_trunc and max_avg_stats is not None):
                 raise ValueError(
@@ -604,22 +604,26 @@ class Diffusion(object):
                     "Do not combine --init_perturb_rho with --running_stat: running-stat "
                     "updates would overwrite the controlled initial scale intervention."
                 )
-            if use_trunc and max_avg_stats is not None and not perturb_enabled:
-                logger.info("[%s] 激活 BRECQ 前：组 %d max_avg 截断", stage_tag, group_id)
-                fp_hooks = apply_max_avg_clipping_to_fp_model(fp_model, max_avg_stats, group_id)
-
             with torch.no_grad():
                 spatial = int(cali_xs.shape[-1]) if cali_xs.ndim >= 4 else 32
                 init_n = 1 if spatial >= 128 else min(64, int(cali_xs.shape[0]))
                 _ = qnn(cali_xs[:init_n].to(self.device), cali_ts[:init_n].to(self.device))
-                if perturb_enabled:
-                    # The preceding forward is the ordinary Min--Max start.  We
-                    # now intervene only on its initial scale; clipping is not
-                    # retained, so BRECQ sees the same objective for every rho.
+                if self.args.running_stat:
+                    qnn.set_running_stat(True)
+                    for i in range(0, cali_xs.size(0), 64):
+                        _ = qnn(cali_xs[i:i + 64].to(self.device), cali_ts[i:i + 64].to(self.device))
+                    qnn.set_running_stat(False)
+
+                group_stats = None
+                if use_trunc and max_avg_stats is not None:
                     group_stats = {
                         layer: groups.get(group_id, None)
                         for layer, groups in max_avg_stats.items()
                     }
+                if perturb_enabled:
+                    # The preceding forward is the ordinary Min--Max start.  We
+                    # now intervene only on its initial scale; clipping is not
+                    # retained, so BRECQ sees the same objective for every rho.
                     minmax_scales = snapshot_activation_scales(qnn)
                     tmma_scales, init_summary = initialize_tmma_interpolation(
                         qnn, group_stats, float(self.args.init_perturb_rho)
@@ -634,11 +638,15 @@ class Diffusion(object):
                         },
                         os.path.join(self.args.logdir, "init_scales_" + stage_tag + ".pt"),
                     )
-                if self.args.running_stat:
-                    qnn.set_running_stat(True)
-                    for i in range(0, cali_xs.size(0), 64):
-                        _ = qnn(cali_xs[i:i + 64].to(self.device), cali_ts[i:i + 64].to(self.device))
-                    qnn.set_running_stat(False)
+                elif group_stats is not None:
+                    init_summary = initialize_tmma_scales(qnn, group_stats)
+                    stage_probe["initialization"] = init_summary
+                    logger.info(
+                        "[%s] 激活 BRECQ 前：组 %d TMMA 初始化 %d 个量化器",
+                        stage_tag,
+                        group_id,
+                        init_summary["matched_quantizers"],
+                    )
 
             kwargs_a = dict(
                 cali_data=cali_data, iters=self.args.cali_iters_a, act_quant=True,
@@ -646,12 +654,6 @@ class Diffusion(object):
             )
             logger.info("[%s] 开始激活 BRECQ 重建", stage_tag)
             recon_model(qnn, kwargs_a, "act_" + stage_tag)
-
-            if fp_hooks:
-                remove_hooks(fp_hooks)
-            if use_trunc and max_avg_stats is not None and not perturb_enabled:
-                set_activation_truncation_from_max_avg(qnn, max_avg_stats, group_id)
-                apply_max_avg_clipping_to_model(qnn)
 
             qnn.set_quant_state(weight_quant=True, act_quant=True)
             if perturb_enabled:
@@ -839,10 +841,10 @@ class Diffusion(object):
         )
         if use_trunc:
             self.max_avg_stats = load_max_avg_statistics(self.args.max_avg_json)
-            logger.info("启用激活截断（max_avg）")
+            logger.info("启用 TMMA 激活尺度初始化（max_avg）")
         else:
             self.max_avg_stats = None
-            logger.info("不进行激活截断（与 Q-Diffusion baseline 一致）")
+            logger.info("不进行 TMMA 激活尺度初始化（与 Q-Diffusion baseline 一致）")
 
         full_seq, first_half_seq, second_half_seq, split_idx = self._build_two_stage_seq()
         batch_size = getattr(self.config.sampling, "batch_size", 50)
@@ -1182,11 +1184,11 @@ def get_parser():
     )
     parser.add_argument(
         "--max_avg_json", type=str, default=None,
-        help="Path to JSON with max_avg stats; omit with --no_act_truncation to skip truncation"
+        help="Path to JSON with grouped TMMA max_avg statistics"
     )
     parser.add_argument(
         "--no_act_truncation", action="store_true",
-        help="disable activation max_avg truncation in two-stage mode"
+        help="disable TMMA activation-scale initialization (legacy option name)"
     )
     perturb = parser.add_argument_group("controlled initialization perturbation")
     perturb.add_argument(

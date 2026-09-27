@@ -27,11 +27,8 @@ from qdiff.quant_layer import UniformAffineQuantizer
 from qdiff.utils import resume_cali_model, get_train_samples
 from qdiff.max_avg_truncation import (
     load_max_avg_statistics,
-    apply_max_avg_clipping_to_fp_model,
-    remove_hooks,
-    set_activation_truncation_from_max_avg,
-    apply_max_avg_clipping_to_model,
 )
+from qdiff.init_perturbation import initialize_tmma_scales
 
 logger = logging.getLogger(__name__)
 
@@ -319,10 +316,6 @@ class Diffusion(object):
 
         if self.args.quant_act:
             qnn.set_quant_state(True, True)
-            fp_hooks = []
-            if max_avg_stats is not None:
-                logger.info("[%s] 激活 BRECQ 前：为 FP 模型注册组 %d max_avg 截断 hook", stage_tag, group_id)
-                fp_hooks = apply_max_avg_clipping_to_fp_model(fp_model, max_avg_stats, group_id)
 
             with torch.no_grad():
                 init_n = min(64, cali_xs.shape[0])
@@ -332,6 +325,18 @@ class Diffusion(object):
                     for i in range(0, cali_xs.size(0), 64):
                         _ = qnn(cali_xs[i:i + 64].to(self.device), cali_ts[i:i + 64].to(self.device))
                     qnn.set_running_stat(False)
+                if max_avg_stats is not None:
+                    group_stats = {
+                        layer: groups.get(group_id, None)
+                        for layer, groups in max_avg_stats.items()
+                    }
+                    init_summary = initialize_tmma_scales(qnn, group_stats)
+                    logger.info(
+                        "[%s] 激活 BRECQ 前：组 %d TMMA 初始化 %d 个量化器",
+                        stage_tag,
+                        group_id,
+                        init_summary["matched_quantizers"],
+                    )
 
             kwargs_a = dict(
                 cali_data=cali_data, iters=self.args.cali_iters_a, act_quant=True,
@@ -339,13 +344,6 @@ class Diffusion(object):
             )
             logger.info("[%s] 开始激活 BRECQ 重建", stage_tag)
             recon_model(qnn, kwargs_a)
-
-            if fp_hooks:
-                remove_hooks(fp_hooks)
-            if max_avg_stats is not None:
-                logger.info("[%s] 为量化模型设置组 %d max_avg 截断（采样生效）", stage_tag, group_id)
-                set_activation_truncation_from_max_avg(qnn, max_avg_stats, group_id)
-                apply_max_avg_clipping_to_model(qnn)
 
             qnn.set_quant_state(weight_quant=True, act_quant=True)
 
@@ -750,7 +748,7 @@ def get_parser():
                         )
     parser.add_argument(
         "--max_avg_json", type=str, default="",
-        help="两阶段 + quant_act 时必需：各层 group0/group1 max_avg 统计 JSON",
+        help="两阶段 + quant_act 时必需：用于 TMMA 尺度初始化的各层 group0/group1 max_avg JSON",
     )
     parser.add_argument(
         "--verbose", action="store_true",

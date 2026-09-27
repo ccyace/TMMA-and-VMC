@@ -341,28 +341,28 @@ class ActivationHook:
         return [self._acts[n] for n in names if n in self._acts]
 
 
-def concat_flattened_activations(
-    hook: ActivationHook, ordered_names: List[str], batch_idx: Optional[int] = None
+def mean_layerwise_element_variance(
+    hook: ActivationHook, ordered_names: List[str]
 ) -> torch.Tensor:
-    """
-    Stage 1 专用：将多层 Conv 输出展平后沿特征维拼接。
+    """Compute Eq. (24)'s equal-weight layer average for one batch.
 
-    若 batch_idx 给定，只取该 batch 元素 → [1, D_total]；
-    否则取整 batch → [B, D_total]。
-    拼接后对整个 D 维求 var，得到「全网络卷积激活」的 element-wise 方差标量。
+    Each layer first contributes one element-wise activation variance per
+    sample.  The result is then averaged over layers, so layers with larger
+    activation tensors do not receive a larger implicit weight.
+
+    Returns
+    -------
+    Tensor[B]
+        The mean layer-wise variance for every sample in the batch.
     """
-    parts = []
-    for name in ordered_names:
-        if name not in hook._acts:
-            continue
-        t = hook._acts[name]
-        if batch_idx is not None:
-            t = t[batch_idx : batch_idx + 1]
-        parts.append(t.flatten(1))
-    if not parts:
-        return torch.zeros(1, 0, device="cpu")
-    return torch.cat(parts, dim=1)
-#每一层的激活都append最后一起拼接展平
+    layer_vars = [
+        var_over_elements_per_sample(hook._acts[name])
+        for name in ordered_names
+        if name in hook._acts
+    ]
+    if not layer_vars:
+        raise RuntimeError("No activation tensors were captured for timestep scoring")
+    return torch.stack(layer_vars, dim=0).mean(dim=0)
 
 # =============================================================================
 # Stage 1：时间步敏感度 S(t) → 权重 w(t)
@@ -386,8 +386,8 @@ def estimate_timestep_sensitivity(
     对每个子步 k（固定 x 来自 traj[k, :]）：
       1. 随机抽 batch_size 张图，固定时间 t = ts_per_step[k]
       2. FP 前向，hook 所有 Conv2d
-      3. 对每张图：拼接所有层激活 → 对 D 维求 var → 得到 Var(A(x))
-      4. batch 内取 mean，多轮 batches_per_step 再取 mean → S(t_k)
+      3. 对每张图、每层分别求 Var_elem(A_l(x))
+      4. 对层等权平均，再对 batch 和多轮 batches_per_step 求均值 → S(t_k)
 
     直觉：某时间步若激活在空间/通道上波动大，量化误差影响也大，应提高抽样权重。
 
@@ -413,12 +413,10 @@ def estimate_timestep_sensitivity(
             hook.clear()
             hook.register(model, conv_names)
             _ = model(x, t)
-            # 逐样本：拼接全层激活 [1,D] → scalar var
-            per_sample = []
-            for bi in range(x.size(0)):
-                cat = concat_flattened_activations(hook, conv_names, batch_idx=bi)
-                per_sample.append(cat.var(unbiased=False).item())
-            vals.append(np.mean(per_sample))
+            # Eq. (24): first compute Var_elem independently for every layer,
+            # then average layers with equal weight and finally average D_t.
+            per_sample = mean_layerwise_element_variance(hook, conv_names)
+            vals.append(float(per_sample.mean().item()))
         hook.remove()
         S_out[k] = float(np.mean(vals)) + 1e-12
     return S_out
@@ -529,7 +527,8 @@ def run_algorithm(
     Stage 3 / Algorithm 1 主循环：动态准入构造最终校准集。
 
     每次提议 (proposal)：
-      1. 按 w 加权随机选子步 k，均匀随机选图像 img_i
+      1. 按剩余候选质量重归一化后的 w 加权随机选子步 k，
+         再从该子步的未使用图像索引中均匀抽取 img_i
       2. 取 x1 = traj[k, img_i]，t = ts_per_step[k]
       3. FP 前向，仅 hook 敏感层 L_sen
       4. 对每层 l：假设接受 x1，用 pool_stats_merge 算合并后方差 Var'
@@ -565,11 +564,42 @@ def run_algorithm(
     proposals = 0
     rng = np.random.default_rng(rng_seed)
 
+    # Algorithm 1 retrieves an unused candidate on every proposal.  Keep a
+    # swap-pop pool per timestep so each (step, image) pair is proposed at
+    # most once without repeatedly allocating or scanning a global set.
+    unused_by_step: List[List[int]] = [
+        list(range(n_pool)) for _ in range(S_steps)
+    ]
+
     while len(accepted_x) < budget and proposals < max_proposals:
+        available = np.fromiter(
+            (len(indices) > 0 for indices in unused_by_step),
+            dtype=np.float64,
+            count=S_steps,
+        )
+        if available.sum() == 0:
+            logger.warning(
+                "候选池已耗尽：所有 %d 个 (timestep, image) pair 均已提议。",
+                S_steps * n_pool,
+            )
+            break
+
         proposals += 1
-        # 按 Stage1 得到的 w(t) 加权选时间步子步
-        k = int(rng.choice(S_steps, p=w))
-        img_i = int(rng.integers(0, n_pool))
+        # 已耗尽的 timestep 权重置零，再对剩余 timestep 重归一化。
+        remaining_w = np.asarray(w, dtype=np.float64) * available
+        remaining_sum = float(remaining_w.sum())
+        if remaining_sum <= 0.0 or not np.isfinite(remaining_sum):
+            remaining_w = available / available.sum()
+        else:
+            remaining_w /= remaining_sum
+        k = int(rng.choice(S_steps, p=remaining_w))
+
+        # 从 timestep k 的未使用索引中均匀抽取，并用 swap-pop O(1) 删除。
+        candidates_k = unused_by_step[k]
+        pos = int(rng.integers(0, len(candidates_k)))
+        img_i = int(candidates_k[pos])
+        candidates_k[pos] = candidates_k[-1]
+        candidates_k.pop()
         x1 = traj[k, img_i : img_i + 1].to(device)
         t_scalar = float(ts_per_step[k].item())
         t = torch.full((1,), t_scalar, device=device, dtype=torch.float32)
@@ -593,7 +623,12 @@ def run_algorithm(
                 m += 1
 
         n_sen = len(sensitive_names)
-        if m > n_sen / 2.0:
+        # Algorithm 1 initializes the pool with the first unused candidate.
+        # Besides matching the paper, this guarantees a valid non-empty pool
+        # even when every captured activation tensor is constant.
+        if proposals == 1:
+            accept = True
+        elif m > n_sen / 2.0:
             accept = True
         else:
             # u > p 则接受；discard_p=0.9 时约 10% 随机接受，增加多样性
@@ -613,9 +648,11 @@ def run_algorithm(
 
     if len(accepted_x) < budget:
         logger.warning(
-            "预算未满：接受 %d / %d（已达 max_proposals=%d）。可调大 max_proposals 或减小 discard_p。",
+            "预算未满：接受 %d / %d（已提议 %d 个不重复候选，max_proposals=%d）。"
+            "可扩大候选池、调大 max_proposals 或减小 discard_p。",
             len(accepted_x),
             budget,
+            proposals,
             max_proposals,
         )
 
